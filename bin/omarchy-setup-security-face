@@ -1,0 +1,198 @@
+#!/bin/bash
+
+# omarchy:summary=Set up face authentication for sudo, polkit, and lock screen
+# omarchy:requires-sudo=true
+
+set -e
+
+
+# PROTOTYPE: facelock-git carries `is-enrolled` and setup's `--no-*` opt-outs;
+# the released 0.1.4 in the AUR does not. Swap this to `facelock-bin` once 0.1.5
+# is published. Nothing else in this script changes with it.
+FACELOCK_AUR_PACKAGE="facelock-git"
+
+install_facelock() {
+  # A facelock built from source is not pacman-owned, and pacman refuses to
+  # overwrite unowned files -- installing the package over it would fail on
+  # file conflicts and leave a half-configured system. Whoever installed it by
+  # hand can keep it; the capability check below is what actually gates us.
+  if omarchy-cmd-present facelock; then
+    echo "Using the facelock already installed ($(facelock --version))."
+    return 0
+  fi
+
+  echo "Installing facelock..."
+  omarchy-pkg-aur-add "$FACELOCK_AUR_PACKAGE"
+}
+
+# The features this script is built on, named individually so a too-old facelock
+# reports what is missing instead of failing later inside a clap parse error.
+require_facelock_features() {
+  local missing=()
+
+  facelock is-enrolled --help &>/dev/null || missing+=("is-enrolled")
+  facelock setup --help 2>/dev/null | grep -q -- "--no-pam" || missing+=("setup --no-pam")
+  facelock setup --help 2>/dev/null | grep -q -- "--systemd" || missing+=("setup --systemd")
+
+  if (( ${#missing[@]} > 0 )); then
+    echo -e "\e[31mThis facelock ($(facelock --version)) is missing: ${missing[*]}\e[0m" >&2
+    echo "Install $FACELOCK_AUR_PACKAGE, or upgrade to facelock 0.1.5 or newer." >&2
+    return 1
+  fi
+}
+
+# --no-pam keeps Omarchy the sole author of every PAM edit, so the stacks stay
+# reviewable here rather than being split across two projects. Models,
+# encryption, the daemon, D-Bus activation, `facelock` group membership and
+# enrollment all still come from facelock's own wizard -- there is no reason to
+# reimplement any of that.
+# No --enroll: the wizard asks. Enrolling is a choice, and someone can wire the
+# stacks up now and enrol later -- the closing message reports whichever way it
+# went. Passing --enroll would take the choice away and make that branch
+# unreachable.
+run_facelock_setup() {
+  sudo facelock setup --no-pam --systemd
+}
+
+# Omarchy owns the lock service file, the backend owns its own line -- the same
+# split facelock already has with sudo and polkit-1. The skeleton names no
+# backend, so another face stack drops in by inserting its auth line above
+# pam_deny with no shell change.
+#
+# The terminator is Omarchy's business, not the backend's: the shell runs
+# password as a separate PamContext, so this service is the face-only lane and a
+# non-match has to resolve as a failure. A backend that abstains would otherwise
+# leave the stack with no verdict, which surfaces to the shell as a PAM error.
+create_lock_face_service() {
+  # Never clobber: another face backend may already be wired into this service,
+  # and rewriting the skeleton would drop its auth line on the floor.
+  if [[ -f /etc/pam.d/omarchy-lock-face ]]; then
+    echo "Lock screen face service already exists."
+    return 0
+  fi
+
+  echo "Configuring the lock screen for face authentication..."
+
+  sudo tee /etc/pam.d/omarchy-lock-face >/dev/null <<'EOF'
+#%PAM-1.0
+auth       required                    pam_deny.so
+account    include                     system-local-login
+EOF
+}
+
+# All three services are required. Face auth covering only some of them is a
+# half-configured system the user cannot notice: the menu reports success and
+# the method silently fails wherever it was missed.
+#
+# The lock service is first because Omarchy owns it and it is what this command
+# exists to configure. Order matters for more than tidiness -- when this loop
+# aborted on the first failure, the lock service was last and so was always the
+# casualty.
+#
+# No clamshell gate, unlike the fingerprint stacks. facelock's own
+# security.abort_if_lid_closed defaults to true, so it declines on a closed lid
+# without pam_exec's help.
+REQUIRED_PAM_SERVICES=(omarchy-lock-face sudo polkit-1)
+
+setup_pam_config() {
+  local service
+  local failed=()
+
+  # Every service is attempted even after one fails, so the report at the end
+  # names all of them rather than only the first.
+  #
+  # No "already configured?" pre-check: facelock's PAM writer is idempotent and
+  # says so, and checking here would mean guessing where a service file lives.
+  # That guess is wrong on any distro shipping PAM config in a vendor directory.
+  for service in "${REQUIRED_PAM_SERVICES[@]}"; do
+    echo "Configuring $service for face authentication..."
+    sudo facelock setup --pam --service "$service" --yes || failed+=("$service")
+  done
+
+  if (( ${#failed[@]} > 0 )); then
+    echo -e "\e[31m\nFailed to configure face authentication for: ${failed[*]}\e[0m" >&2
+    echo "Face authentication is incomplete and will not work for those services." >&2
+    echo "Fix the cause and re-run this command, or undo it with:" >&2
+    echo "  omarchy-remove-security-face" >&2
+    return 1
+  fi
+}
+
+
+# True when the group database has us in `facelock` but this session's process
+# credentials do not. `id -nG` with no argument reports the credentials this
+# process started with; `id -nG "$USER"` re-reads the database. They differ
+# exactly when the group was added after login, which is the case worth warning
+# about -- and they agree for someone who was already a member, so a re-run of
+# this command does not nag.
+session_missing_facelock_group() {
+  local in_database in_session
+  id -nG "$USER" 2>/dev/null | grep -qw facelock && in_database=1 || in_database=0
+  id -nG 2>/dev/null | grep -qw facelock && in_session=1 || in_session=0
+
+  (( in_database == 1 && in_session == 0 ))
+}
+
+
+echo -e "\e[32mSetting up face authentication.\n\e[0m"
+echo "This works best with an infrared camera. facelock will pick one during"
+echo -e "setup, and refuses a plain RGB webcam unless you relax that yourself.\n"
+
+# No hardware precheck on purpose. Whether a camera is usable is facelock's
+# call, not ours: an IR camera can need quirks before it is even detected, and
+# a user can knowingly relax security.require_ir. A crude greyscale probe here
+# would hide the menu entry from both of them, and the second classifier could
+# disagree with facelock's for no good reason. Let facelock's wizard decide.
+install_facelock
+require_facelock_features
+
+# set -e stops here if the wizard fails, which is the whole gate. Enrolling is
+# optional inside it, and declining is a legitimate choice -- someone can wire
+# up the stacks now and enrol later. So do not demand a passing `facelock test`:
+# in sudo and polkit-1 the backend's line is `sufficient` and falls through to
+# the password prompt when no face matches, and the lock service is a lane the
+# shell only offers alongside the password field. Nothing here locks anyone out.
+run_facelock_setup
+
+create_lock_face_service
+setup_pam_config
+
+# No omarchy-restart-shell: the lock plugin watches the PAM service file, so it
+# picks this up immediately.
+
+if facelock is-enrolled --quiet 2>/dev/null; then
+  echo -e "\e[32m\nFace authentication is now configured.\e[0m"
+else
+  echo -e "\e[32m\nFace authentication is set up, but no face is enrolled yet.\e[0m"
+  echo "Everything is wired up and starts working the moment you enrol:"
+  echo
+  echo "  facelock enroll"
+fi
+
+# Setup puts the user in the `facelock` group, and the backend's D-Bus policy
+# answers only root and that group. Supplementary groups are fixed when the
+# session starts, so this session -- and everything in it, including the shell
+# that draws the lock screen -- still carries the old set. Restarting the shell
+# does not help: it inherits the session's groups.
+#
+# So until the user logs back in, face auth is fully configured and cannot work.
+# Announcing "ready" here would be false, and it is the specific falsehood that
+# sends someone to the lock screen to watch it fail.
+if session_missing_facelock_group; then
+  echo
+  echo -e "\e[33mLog out and back in before using face authentication.\e[0m"
+  echo "You were added to the 'facelock' group, which this session cannot see yet."
+
+  omarchy-notification-send -g 󰱻 "Face Authentication Needs a Logout" \
+    "Log out and back in to finish setting up face authentication."
+
+  if gum confirm "Log out now?"; then
+    omarchy-system-logout
+  fi
+else
+  echo "You can use your face for sudo and polkit, and at the lock screen"
+  echo "(Super + Ctrl + L) on a shell that offers it."
+
+  omarchy-notification-send -g 󰱻 "Face Authentication Ready" \
+    "Your face now works for sudo, polkit, and the lock screen."
+fi

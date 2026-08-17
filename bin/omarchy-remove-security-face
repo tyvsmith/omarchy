@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# omarchy:summary=Remove face authentication from sudo, polkit, and lock screen
+# omarchy:requires-sudo=true
+
+set -e
+
+
+remove_pam_config() {
+  local service
+
+  for service in sudo polkit-1 omarchy-lock-face; do
+    [[ -f /etc/pam.d/$service ]] || continue
+    grep -q pam_facelock.so "/etc/pam.d/$service" || continue
+
+    echo "Removing face authentication from $service..."
+    # Delegate rather than sed: facelock owns the exact shape of the line it
+    # wrote, including whatever module arguments the setup chose.
+    sudo facelock setup --pam --service "$service" --remove --yes
+  done
+}
+
+# True when nothing but the pam_deny terminator is left in the auth stack. This
+# is how we tell "Omarchy's empty skeleton" from "another backend is still using
+# this service" without knowing any backend's module name.
+lock_face_is_bare() {
+  ! grep -E '^[[:space:]]*auth' /etc/pam.d/omarchy-lock-face 2>/dev/null |
+    grep -qv 'pam_deny\.so'
+}
+
+remove_lock_face_service() {
+  [[ -f /etc/pam.d/omarchy-lock-face ]] || return 0
+
+  # facelock's line is already gone by now, so what remains tells us whether
+  # anyone else still needs this service. Howdy and friends share it, and
+  # deleting the file underneath them would take their face auth with it.
+  if ! lock_face_is_bare; then
+    echo "Another face backend still uses the lock screen; leaving its service in place."
+    sudo rm -f /etc/pam.d/omarchy-lock-face.facelock-backup
+    return 0
+  fi
+
+  echo "Removing the lock screen face service..."
+  # Nothing but pam_deny left, which would be a lane that only ever denies.
+  # Omarchy owns this file, so it goes rather than lingering as a dead offer.
+  sudo rm -f /etc/pam.d/omarchy-lock-face /etc/pam.d/omarchy-lock-face.facelock-backup
+}
+
+remove_enrollment() {
+  # Biometric templates must not survive an uninstall.
+  echo "Removing enrolled face models..."
+  sudo facelock clear --user "$USER" --yes
+}
+
+
+echo -e "\e[32mRemoving face authentication.\n\e[0m"
+
+if omarchy-cmd-missing facelock; then
+  # The PAM files can outlive the binary if facelock was removed by hand, and a
+  # dangling omarchy-lock-face would leave the lock screen offering a scan no
+  # module can answer. Without facelock we cannot ask it to withdraw its own
+  # line, so only clean up when nothing else is using the service.
+  remove_lock_face_service
+  echo "facelock is not installed; nothing else to remove."
+  exit 0
+fi
+
+remove_pam_config
+remove_lock_face_service
+remove_enrollment
+
+echo "Removing facelock..."
+# Only drop what pacman owns. A hand-built facelock is not ours to delete.
+omarchy-pkg-drop facelock facelock-bin facelock-git
+
+# No omarchy-restart-shell, matching setup: a shell that offers face auth learns
+# it from the PAM service file, which is already gone by here.
+
+echo -e "\e[32mFace authentication has been removed.\e[0m"
