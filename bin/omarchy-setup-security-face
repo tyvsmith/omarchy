@@ -6,6 +6,8 @@
 
 set -e
 
+pam_dir="${OMARCHY_PAM_DIR:-/etc/pam.d}"
+
 # Omarchy owns the lock service; the backend inserts its own auth line above
 # pam_deny. The terminator matters: the shell runs password as a separate PAM
 # context, so this lane has to fail on a non-match rather than abstain.
@@ -13,10 +15,10 @@ set -e
 # own error code to the shell instead of a clean denial from pam_deny.
 create_lock_face_service() {
   # Never clobber: a backend may already be wired into it.
-  [[ -f /etc/pam.d/omarchy-lock-face ]] && return 0
+  [[ -f $pam_dir/omarchy-lock-face ]] && return 0
 
   echo "Configuring the lock screen for face authentication..."
-  sudo tee /etc/pam.d/omarchy-lock-face >/dev/null <<'EOF'
+  sudo tee "$pam_dir/omarchy-lock-face" >/dev/null <<'EOF'
 #%PAM-1.0
 auth       required                    pam_deny.so
 account    include                     system-local-login
@@ -26,7 +28,7 @@ EOF
 # One backend at a time: two face stacks in one PAM chain means two camera grabs
 # and two prompts, and removal could no longer tell whose line is whose.
 other_backend_configured() {
-  grep -E '^[[:space:]]*auth' /etc/pam.d/omarchy-lock-face 2>/dev/null |
+  grep -E '^[[:space:]]*auth' "$pam_dir/omarchy-lock-face" 2>/dev/null |
     grep -v 'pam_deny\.so' | grep -qv "$pam_module"
 }
 

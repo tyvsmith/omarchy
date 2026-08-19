@@ -5,26 +5,28 @@
 
 set -e
 
+pam_dir="${OMARCHY_PAM_DIR:-/etc/pam.d}"
+
 # True when $1's module is in the lock service, or failing that $1 is installed:
 # setup can be refused after its wizard has run, and a hand-deleted lock service
 # still leaves the package behind.
 provider_configured() {
-  grep -Es '^[[:space:]]*auth[[:space:]]' /etc/pam.d/omarchy-lock-face | grep -q "pam_$1\.so" ||
+  grep -Es '^[[:space:]]*auth[[:space:]]' "$pam_dir/omarchy-lock-face" | grep -q "pam_$1\.so" ||
     omarchy-cmd-present "$1"
 }
 
 # Delete the lock service once nothing but pam_deny is left. A line from any
 # other backend keeps it, without this script knowing that backend's name.
 remove_lock_face_service() {
-  [[ -f /etc/pam.d/omarchy-lock-face ]] || return 0
+  [[ -f $pam_dir/omarchy-lock-face ]] || return 0
 
-  if grep -E '^[[:space:]]*auth' /etc/pam.d/omarchy-lock-face | grep -qv 'pam_deny\.so'; then
+  if grep -E '^[[:space:]]*auth' "$pam_dir/omarchy-lock-face" | grep -qv 'pam_deny\.so'; then
     echo "Another face backend still uses the lock screen; leaving its service in place."
     return 0
   fi
 
   echo "Removing the lock screen face service..."
-  sudo rm -f /etc/pam.d/omarchy-lock-face
+  sudo rm -f "$pam_dir/omarchy-lock-face"
 }
 
 # --- facelock ---
@@ -39,7 +41,7 @@ remove_facelock() {
 
   echo "Removing face authentication from sudo, polkit, and the lock screen..."
   sudo facelock pam remove --service sudo --service polkit-1 --service omarchy-lock-face --if-present --no-confirm
-  sudo rm -f /etc/pam.d/omarchy-lock-face.facelock-backup
+  sudo rm -f "$pam_dir/omarchy-lock-face.facelock-backup"
 
   echo "Removing enrolled face models..."
   sudo facelock clear --yes
